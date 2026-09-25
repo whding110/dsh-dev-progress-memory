@@ -1,0 +1,62 @@
+# cordis.patch.yml — mount the dsh-dev-progress-memory plugin
+#
+# Copy this snippet into your profile's cordis.patch.yml (or create one)
+# to activate the dev progress memory plugin.
+#
+# The plugin registers:
+#   - turn/end hook: classifies completed turns → doc/progress/
+#   - agent/pre-step hook: injects INDEX.md + system memory retrieval
+#   - agent/request-error hook: context-overflow recovery with handoff
+#   - progress_read tool: on-demand full document loading
+
+- insert:
+    - id: dsh-dev-progress-memory   # 插件在配置树中的唯一 id
+      name: dsh-dev-progress-memory # package.json 中的包名
+      config:
+
+      # --- Core settings ---
+
+      # Workspace-relative directory for progress .md files
+      progressDir: doc/progress
+
+      # INDEX.md hard limits (rewrites rather than truncates)
+      indexMaxLines: 200
+      indexMaxBytes: 25600
+
+      # SYSTEM_MEMORY.md total character budget (triggers archival on overflow)
+      systemMemoryBudget: 8000
+
+      # Max characters per system-memory entry
+      systemMemoryEntryBudget: 2200
+
+      # ---- Compact settings ----
+
+      # Whether proactive compact is enabled
+      compactEnabled: true
+
+      # Pressure ratio to trigger compact (fraction of context window)
+      # 0.75 means compact when estimated tokens reach 75% of available window
+      # This is deliberately below the DSH default of 0.8 to leave safety margin
+      compactPressureRatio: 0.75
+
+      # ---- LLM settings ----
+
+      # LLM route for classification & summarization (empty = reuse current session route)
+      summarizationProvider: ""
+      summarizationModel: ""
+
+      # Max output tokens for classification calls
+      classifyMaxTokens: 2048
+
+      # Max output tokens for handoff summarization
+      summarizeMaxTokens: 4096
+
+      # ---- Feature toggles ----
+
+      progressEnabled: true
+      systemMemoryEnabled: true
+
+      # ---- Timing ----
+
+      # Debounce delay in ms before writing turn classification results
+      debounceMs: 1000

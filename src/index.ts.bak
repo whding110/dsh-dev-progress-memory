@@ -1,0 +1,964 @@
+/**
+ * DSH Dev Progress Memory Plugin
+ *
+ * Four-in-one plugin for software development:
+ * 1. Per-turn progress classification → doc/progress/ time-indexed .md files
+ * 2. Cross-project system-level bug memory → ~/.dsh/memories/SYSTEM_MEMORY.md
+ * 3. Token optimization: index/detail separation, dedup injection, compressed writes, budget enforcement
+ * 4. Context-overflow compact continuation with pre-emptive pressure detection
+ *
+ * @module dsh-dev-progress-memory
+ */
+
+import type { Context } from '@deepseek-ai/cordis';
+import z from '@deepseek-ai/schemastery';
+import type { Agent } from '@deepseek-ai/dsh-agent';
+import type { Session, SessionEvent, UserMessage } from '@deepseek-ai/dsh-session';
+import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools';
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
+import { errorChain } from '@deepseek-ai/dsh-llm';
+import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+// -----------------------------------------------------------------------
+// Config schema
+// -----------------------------------------------------------------------
+
+export const Config = z.object({
+  /** Workspace-relative directory for progress documents. Default: doc/progress */
+  progressDir: z.string().default('doc/progress'),
+
+  /** Maximum lines in INDEX.md before rewrite. Default: 200 */
+  indexMaxLines: z.number().int().min(50).max(500).default(200),
+
+  /** Maximum bytes in INDEX.md before rewrite. Default: 25600 */
+  indexMaxBytes: z.number().int().min(4096).max(65536).default(25600),
+
+  /** Total character budget for SYSTEM_MEMORY.md. Default: 8000 */
+  systemMemoryBudget: z.number().int().min(2000).max(32000).default(8000),
+
+  /** Max characters per system-memory entry. Default: 2200 */
+  systemMemoryEntryBudget: z.number().int().min(500).max(5000).default(2200),
+
+  /** Pressure ratio to trigger proactive compact (fraction of context window). Default: 0.75 */
+  compactPressureRatio: z.number().min(0.5).max(0.9).default(0.75),
+
+  /** Debounce delay in ms for turn/end write. Default: 1000 */
+  debounceMs: z.number().int().min(100).max(5000).default(1000),
+
+  /** LLM summarization provider (empty = use current session route). */
+  summarizationProvider: z.string().default(''),
+
+  /** LLM summarization model (empty = use current session route). */
+  summarizationModel: z.string().default(''),
+
+  /** Max tokens for LLM classification call. Default: 2048 */
+  classifyMaxTokens: z.number().int().min(512).max(8192).default(2048),
+
+  /** Max tokens for LLM summarization call (compact handoff). Default: 4096 */
+  summarizeMaxTokens: z.number().int().min(1024).max(16384).default(4096),
+
+  /** Whether automatic compact is enabled. Default: true */
+  compactEnabled: z.boolean().default(true),
+
+  /** Whether progress classification is enabled. Default: true */
+  progressEnabled: z.boolean().default(true),
+
+  /** Whether system memory is enabled. Default: true */
+  systemMemoryEnabled: z.boolean().default(true),
+});
+
+type ResolvedConfig = z.infer<typeof Config>;
+
+// -----------------------------------------------------------------------
+// Plugin registration
+// -----------------------------------------------------------------------
+
+export const name = 'dsh-dev-progress-memory';
+
+export const inject = [
+  'tools',
+  'sessions',
+  'llm',
+  'tokenMeter',
+  'compaction',
+] as const;
+
+// -----------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------
+
+/** Dimensions for turn classification. */
+const PROGRESS_DIMENSIONS = [
+  'feature-implementation',
+  'architecture-decision',
+  'bug-fix',
+  'dependency-change',
+  'todo',
+  'refactor',
+  'testing',
+  'documentation',
+  'environment-config',
+] as const;
+
+type Dimension = (typeof PROGRESS_DIMENSIONS)[number];
+
+/** Error keywords that trigger system-memory retrieval in pre-step. */
+const ERROR_TRIGGER_KEYWORDS = [
+  '报错', '失败', 'crash', 'EACCES', 'ENOENT', 'timeout', '429',
+  'error', 'Error', 'ERROR', 'fail', 'Failed', 'FAILED',
+  'exception', 'stack trace', 'traceback',
+  "doesn't work", 'not working', 'broken',
+  'connection refused', 'port', 'permission',
+  'EADDRINUSE', 'ECONNREFUSED', 'ETIMEDOUT',
+  'EPERM', 'ENOTFOUND', 'EMFILE', 'ENOSPC',
+  'out of memory', 'OOM', 'segfault',
+  'version mismatch', 'incompatible', 'dependency conflict',
+  'certificate', 'SSL', 'TLS',
+  'npm ERR!', 'pnpm ERR!', 'yarn ERR!',
+  'compile error', 'linker error',
+  'kernel', 'systemd', 'docker', 'container',
+];
+
+// -----------------------------------------------------------------------
+// LLM prompts
+// -----------------------------------------------------------------------
+
+const CLASSIFY_PROMPT = `You are a software development progress classifier. Analyze the conversation turn below and classify it into applicable dimensions.
+
+Dimensions: feature-implementation, architecture-decision, bug-fix, dependency-change, todo, refactor, testing, documentation, environment-config.
+
+For each matching dimension, provide:
+1. A one-line summary of what was accomplished or decided
+2. Key file paths changed or referenced
+3. Any unresolved issues or open questions
+
+Also detect if this turn involved a SYSTEM-LEVEL issue that could affect OTHER projects (environment config, system errors, dependency conflicts, port/permission issues, version mismatches). If yes, provide structured details.
+
+Respond ONLY with valid JSON:
+{
+  "classifications": [
+    {
+      "dimension": "dimension-name",
+      "summary": "one-line summary",
+      "files": ["path/to/file"],
+      "unresolved": ["open question"]
+    }
+  ],
+  "systemIssue": null
+}
+
+For systemIssue, use this shape if present:
+{
+  "symptom": "observed problem",
+  "investigation": "steps taken to diagnose",
+  "rootCause": "identified root cause",
+  "solution": "solution applied",
+  "versions": "relevant system/tool versions"
+}`;
+
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+
+function ensureDir(dir: string): void {
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+}
+
+function memoryId(kind: string, key: string): string {
+  return `${kind}:${key}`;
+}
+
+// -----------------------------------------------------------------------
+// Main plugin
+// -----------------------------------------------------------------------
+
+export function apply(ctx: Context) {
+  // Resolve config — Cordis merges intercept config through the plugin name.
+  // We read the resolved config from the context's reflect layer.
+  let rawConfig: Partial<ResolvedConfig> = {};
+  try {
+    rawConfig = (ctx as any).reflect?.resolveConfig?.(name) ?? {};
+  } catch {
+    // Not available in all Cordis versions; fall back to defaults
+  }
+
+  // Merge with defaults (Config schema defaults are applied by schemastery)
+  const cfg: ResolvedConfig = {
+    progressDir: rawConfig.progressDir ?? 'doc/progress',
+    indexMaxLines: rawConfig.indexMaxLines ?? 200,
+    indexMaxBytes: rawConfig.indexMaxBytes ?? 25600,
+    systemMemoryBudget: rawConfig.systemMemoryBudget ?? 8000,
+    systemMemoryEntryBudget: rawConfig.systemMemoryEntryBudget ?? 2200,
+    compactPressureRatio: rawConfig.compactPressureRatio ?? 0.75,
+    debounceMs: rawConfig.debounceMs ?? 1000,
+    summarizationProvider: rawConfig.summarizationProvider ?? '',
+    summarizationModel: rawConfig.summarizationModel ?? '',
+    classifyMaxTokens: rawConfig.classifyMaxTokens ?? 2048,
+    summarizeMaxTokens: rawConfig.summarizeMaxTokens ?? 4096,
+    compactEnabled: rawConfig.compactEnabled ?? true,
+    progressEnabled: rawConfig.progressEnabled ?? true,
+    systemMemoryEnabled: rawConfig.systemMemoryEnabled ?? true,
+  };
+
+  // Resolve DSH home path for system memory
+  const dshHome = dshHomePath();
+  const memoriesDir = join(dshHome, 'memories');
+  const systemMemoryPath = join(memoriesDir, 'SYSTEM_MEMORY.md');
+  const systemMemoryArchivePath = join(memoriesDir, 'SYSTEM_MEMORY_ARCHIVE.md');
+
+  // Session-level state
+  const injectedMemories = new Set<string>();
+  const compactStates = new Map<string, { lastCompactGeneration: number; turnTokenBaseline: number }>();
+
+  // Debounce timer
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingTurns: Array<{ session: Session; turn: number; messages: string }> = [];
+
+  // -------------------------------------------------------------------
+  // Tool: progress_read
+  // -------------------------------------------------------------------
+  const progressReadTool: ToolDefinition = {
+    name: 'progress_read',
+    description:
+      'Read a full progress document or INDEX.md from doc/progress/. Call when the model needs detailed context from a specific project progress category.',
+    parameters: {
+      type: 'object',
+      properties: {
+        dimension: {
+          type: 'string',
+          description:
+            'Progress dimension to read (e.g. "feature-implementation", "bug-fix", "architecture-decision"). Use "index" to read INDEX.md.',
+        },
+        date: {
+          type: 'string',
+          description:
+            'ISO date string (YYYY-MM-DD) of the file to read. If omitted, reads the latest file for the given dimension.',
+        },
+      },
+      required: ['dimension'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'string' } as any,
+      render(_args: unknown, value: unknown) {
+        return [{ type: 'text' as const, text: value as string }];
+      },
+    },
+    async execute(args: unknown, _exec: ToolRunContext): Promise<string> {
+      const { dimension, date } = args as { dimension: string; date?: string };
+
+      // Resolve progress dir from the executing agent's session
+      const agent = _exec.agent;
+      const session = agent ? ctx.sessions.get(agent.id) : undefined;
+      const cwd = session?.header?.cwd ?? process.cwd();
+      const progressDir = join(cwd, cfg.progressDir);
+      ensureDir(progressDir);
+
+      if (dimension === 'index') {
+        const indexPath = join(progressDir, 'INDEX.md');
+        if (!existsSync(indexPath)) {
+          return '(INDEX.md does not exist yet — no progress entries have been recorded)';
+        }
+        return readFileSync(indexPath, 'utf-8');
+      }
+
+      const prefix = `${dimension}-`;
+      let targetFile: string | null = null;
+
+      if (date) {
+        const candidate = join(progressDir, `${prefix}${date}.md`);
+        if (existsSync(candidate)) targetFile = candidate;
+      } else {
+        const fs = await import('node:fs/promises');
+        try {
+          const files = await fs.readdir(progressDir);
+          const matches = files
+            .filter((f) => f.startsWith(prefix) && f.endsWith('.md'))
+            .sort()
+            .reverse();
+          if (matches.length > 0) targetFile = join(progressDir, matches[0]);
+        } catch {
+          return `(Cannot read progress directory: ${progressDir})`;
+        }
+      }
+
+      if (!targetFile || !existsSync(targetFile)) {
+        return `(No progress file found for dimension "${dimension}"${date ? ` on ${date}` : ''})`;
+      }
+
+      return readFileSync(targetFile, 'utf-8');
+    },
+  };
+
+  ctx.tools.register(progressReadTool);
+
+  // -------------------------------------------------------------------
+  // Index maintenance
+  // -------------------------------------------------------------------
+  function updateIndex(dimension: string, fileName: string, summary: string): void {
+    // Resolve progress dir from any live session
+    const sessions = ctx.sessions?.list() ?? [];
+    const cwd = sessions[0]?.header?.cwd ?? process.cwd();
+    const progressDir = join(cwd, cfg.progressDir);
+    ensureDir(progressDir);
+    const indexPath = join(progressDir, 'INDEX.md');
+
+    const now = new Date().toISOString();
+    const safeSummary = summary.slice(0, 120).replace(/\|/g, '\\|');
+    const line = `| ${dimension} | [${fileName}](${fileName}) | ${safeSummary} | ${now} |`;
+
+    let content: string;
+    if (existsSync(indexPath)) {
+      content = readFileSync(indexPath, 'utf-8');
+
+      if (Buffer.byteLength(content, 'utf-8') > cfg.indexMaxBytes) {
+        content = rewriteIndex(content, line, cfg);
+      } else {
+        const entryLines = content.split('\n').filter((l) => l.startsWith('|'));
+        if (entryLines.length >= cfg.indexMaxLines) {
+          content = rewriteIndex(content, line, cfg);
+        } else {
+          content += `\n${line}`;
+        }
+      }
+    } else {
+      content = [
+        '# Project Progress Index',
+        '',
+        '| 维度 | 文件 | 摘要 | 更新时间 |',
+        '|------|------|------|----------|',
+        line,
+      ].join('\n');
+    }
+
+    writeFileSync(indexPath, content);
+  }
+
+  function rewriteIndex(existingContent: string, newLine: string, cfg: ResolvedConfig): string {
+    const lines = existingContent.split('\n');
+    const headerLines = lines.slice(0, 4);
+    const entries = lines.slice(4).filter((l) => l.startsWith('|'));
+    entries.push(newLine);
+
+    const maxEntries = Math.min(cfg.indexMaxLines, Math.floor(cfg.indexMaxBytes / 200));
+    const kept = entries.slice(-Math.max(1, maxEntries));
+
+    return `${headerLines.join('\n')}\n${kept.join('\n')}`;
+  }
+
+  // -------------------------------------------------------------------
+  // System memory
+  // -------------------------------------------------------------------
+  function writeSystemMemorySync(issue: {
+    symptom: string;
+    investigation: string;
+    rootCause: string;
+    solution: string;
+    versions: string;
+  }): void {
+    ensureDir(memoriesDir);
+
+    const now = new Date().toISOString();
+    const entryParts = [
+      `**现象**: ${issue.symptom}`,
+      `**排查**: ${issue.investigation}`,
+      `**根因**: ${issue.rootCause}`,
+      `**方案**: ${issue.solution}`,
+      `**版本**: ${issue.versions}`,
+      `**时间**: ${now}`,
+    ];
+
+    let entry = entryParts.join('  \n');
+    if (entry.length > cfg.systemMemoryEntryBudget) {
+      entry = entry.slice(0, cfg.systemMemoryEntryBudget - 3) + '...';
+    }
+
+    const newEntry = `\n\n§ ${entry}`;
+    if (existsSync(systemMemoryPath)) {
+      appendFileSync(systemMemoryPath, newEntry);
+    } else {
+      writeFileSync(systemMemoryPath, `# System Bug Memory\n\n${newEntry}`);
+    }
+
+    enforceSystemMemoryBudget();
+  }
+
+  function enforceSystemMemoryBudget(): void {
+    if (!existsSync(systemMemoryPath)) return;
+
+    const content = readFileSync(systemMemoryPath, 'utf-8');
+    if (content.length <= cfg.systemMemoryBudget) return;
+
+    ctx.logger?.info?.(
+      '[dev-progress-memory] System memory budget exceeded, archiving oldest entries',
+    );
+
+    const parts = content.split('§');
+    const header = parts[0] ?? '';
+    const entries = parts.slice(1);
+
+    if (entries.length <= 1) return;
+
+    const splitPoint = Math.ceil(entries.length / 2);
+    const archived = entries.slice(0, splitPoint);
+    const kept = entries.slice(splitPoint);
+
+    const archiveLine = `\n## Archived ${new Date().toISOString().slice(0, 10)}\n\n${archived
+      .map((e) => `§ ${e.trim()}`)
+      .join('\n')}`;
+    if (existsSync(systemMemoryArchivePath)) {
+      appendFileSync(systemMemoryArchivePath, archiveLine);
+    } else {
+      writeFileSync(systemMemoryArchivePath, `# System Bug Memory Archive\n${archiveLine}`);
+    }
+
+    const newContent = `${header.trim()}${kept.map((e) => `§${e}`).join('')}`;
+    writeFileSync(systemMemoryPath, newContent);
+  }
+
+  function searchSystemMemory(keywords: string[]): string | null {
+    if (!existsSync(systemMemoryPath)) return null;
+
+    const content = readFileSync(systemMemoryPath, 'utf-8');
+    const entries = content.split('§').slice(1);
+
+    const matched: string[] = [];
+    for (const entry of entries) {
+      const lower = entry.toLowerCase();
+      if (keywords.some((kw) => lower.includes(kw.toLowerCase()))) {
+        matched.push(entry.trim());
+        if (matched.length >= 3) break;
+      }
+    }
+
+    if (matched.length === 0) return null;
+    return matched.map((e) => `§ ${e}`).join('\n');
+  }
+
+  // -------------------------------------------------------------------
+  // Debounced flush
+  // -------------------------------------------------------------------
+  async function flushPendingTurns(): Promise<void> {
+    if (pendingTurns.length === 0) return;
+
+    const turns = pendingTurns.splice(0);
+    const combinedMessages = turns.map((t) => `[Turn ${t.turn}]\n${t.messages}`).join('\n\n---\n\n');
+
+    try {
+      await classifyAndWrite(combinedMessages);
+    } catch (err) {
+      ctx.logger?.warn?.(`[dev-progress-memory] Classification failed (non-blocking): ${errorChain(err)}`);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // LLM classification
+  // -------------------------------------------------------------------
+  async function classifyAndWrite(conversationText: string): Promise<void> {
+    // Resolve LLM route
+    let effectiveProvider = cfg.summarizationProvider;
+    let effectiveModel = cfg.summarizationModel;
+
+    if (!effectiveProvider || !effectiveModel) {
+      const sessions = ctx.sessions?.list() ?? [];
+      const liveSession = sessions[0];
+      if (liveSession) {
+        const header = liveSession.requestHeader();
+        if (header?.config.provider) effectiveProvider = header.config.provider;
+        if (header?.config.model) effectiveModel = header.config.model;
+      }
+    }
+
+    if (!effectiveProvider || !effectiveModel) {
+      await writeRawProgress(conversationText);
+      return;
+    }
+
+    try {
+      const assembler = new BlockAssembler();
+      const messages = [
+        createUserMessage({
+          content: [{ type: 'text', text: CLASSIFY_PROMPT }],
+          source: { kind: 'plugin' as const, plugin: 'dsh-dev-progress-memory' },
+        }),
+        createUserMessage({
+          content: [{ type: 'text', text: conversationText.slice(0, 12000) }],
+          source: { kind: 'plugin' as const, plugin: 'dsh-dev-progress-memory' },
+        }),
+      ];
+
+      const streamOptions = {
+        provider: effectiveProvider,
+        model: effectiveModel,
+        messages,
+        maxTokens: cfg.classifyMaxTokens,
+        sessionId: `dev-progress-memory-classify-${randomUUID()}`,
+        purpose: 'classification' as const,
+      };
+
+      for await (const chunk of ctx.llm.stream(streamOptions)) {
+        assembler.push(chunk);
+      }
+
+      const blocks = assembler.blocks();
+      const text = blocks
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('');
+
+      // Parse JSON from LLM response
+      let parsed: any;
+      try {
+        const jsonMatch =
+          text.match(/```(?:json)?\s*([\s\S]*?)```/) ?? text.match(/(\{[\s\S]*\})/);
+        const jsonText = jsonMatch ? jsonMatch[1]!.trim() : text.trim();
+        parsed = JSON.parse(jsonText);
+      } catch {
+        await writeRawProgress(conversationText);
+        return;
+      }
+
+      const classifications: Array<{
+        dimension: string;
+        summary: string;
+        files: string[];
+        unresolved: string[];
+      }> = parsed?.classifications ?? [];
+
+      if (classifications.length === 0) {
+        await writeRawProgress(conversationText);
+        return;
+      }
+
+      // Use the first live session's cwd
+      const sessions = ctx.sessions?.list() ?? [];
+      const cwd = sessions[0]?.header?.cwd ?? process.cwd();
+      const progressDir = join(cwd, cfg.progressDir);
+      ensureDir(progressDir);
+
+      const today = new Date().toISOString().slice(0, 10);
+
+      for (const entry of classifications) {
+        const dim = entry.dimension;
+        const fileName = `${dim}-${today}.md`;
+        const filePath = join(progressDir, fileName);
+
+        const compressedContent = [
+          `# ${dim} — ${today}`,
+          '',
+          `**摘要**: ${entry.summary}`,
+          '',
+          entry.files.length > 0
+            ? `**涉及文件**:\n${entry.files.map((f) => `- \`${f}\``).join('\n')}`
+            : '',
+          '',
+          entry.unresolved.length > 0
+            ? `**待解决问题**:\n${entry.unresolved.map((u) => `- ${u}`).join('\n')}`
+            : '',
+        ]
+          .filter((l) => l !== '')
+          .join('\n');
+
+        if (existsSync(filePath)) {
+          appendFileSync(filePath, `\n\n---\n\n${compressedContent}`);
+        } else {
+          writeFileSync(filePath, compressedContent);
+        }
+
+        updateIndex(dim, fileName, entry.summary);
+      }
+
+      if (cfg.systemMemoryEnabled && parsed?.systemIssue) {
+        writeSystemMemorySync(parsed.systemIssue);
+      }
+    } catch (err) {
+      ctx.logger?.warn?.(`[dev-progress-memory] LLM classification failed: ${errorChain(err)}`);
+      try {
+        await writeRawProgress(conversationText);
+      } catch {
+        // fully silent
+      }
+    }
+  }
+
+  async function writeRawProgress(text: string): Promise<void> {
+    const sessions = ctx.sessions?.list() ?? [];
+    const cwd = sessions[0]?.header?.cwd ?? process.cwd();
+    const progressDir = join(cwd, cfg.progressDir);
+    ensureDir(progressDir);
+
+    const today = new Date().toISOString().slice(0, 10);
+    const filePath = join(progressDir, `raw-${today}.md`);
+    const entry = `\n\n---\n\n${text.slice(0, 4000)}`;
+
+    if (existsSync(filePath)) {
+      appendFileSync(filePath, entry);
+    } else {
+      writeFileSync(filePath, entry);
+    }
+
+    updateIndex('raw', `raw-${today}.md`, text.slice(0, 100).replace(/\n/g, ' '));
+  }
+
+  // ===================================================================
+  // EVENT HOOKS
+  // ===================================================================
+
+  // --- Hook 1: session/event → detect turn/end, classify & write ---
+  // session/event signature: (this: Scoped<Session>, session: Session, event: SessionEvent) => void
+  // MUST use regular function for correct `this` to be the Scoped<Session> carrier.
+  ctx.on('session/event', function (
+    this: any,
+    session: Session,
+    event: SessionEvent,
+  ): void {
+    if (event.type !== 'turn/end') return;
+    if (event.data.reason.kind !== 'completed') return;
+    if (!cfg.progressEnabled && !cfg.systemMemoryEnabled) return;
+
+    // Collect this turn's surface messages
+    const allEvents = session.snapshotEvents();
+    const turnEvents = allEvents.filter((e) => {
+      const data = (e as any).data;
+      return data?.turn === event.data.turn;
+    });
+
+    const messageTexts: string[] = [];
+    for (const ev of turnEvents) {
+      if (ev.type === 'user/message') {
+        for (const block of ev.data.content) {
+          if (block.type === 'text') messageTexts.push(`[User]: ${block.text}`);
+        }
+      } else if (ev.type === 'assistant/message') {
+        for (const block of ev.data.message.content) {
+          if (block.type === 'text') {
+            const t = block.text.length > 2000 ? block.text.slice(0, 2000) + '...(truncated)' : block.text;
+            messageTexts.push(`[Assistant]: ${t}`);
+          } else if (block.type === 'tool-call') {
+            messageTexts.push(`[Tool Call]: ${block.name}(${block.arguments.slice(0, 200)})`);
+          }
+        }
+      } else if (ev.type === 'tool/result') {
+        const textBlocks = ev.data.message.content.filter((b: any) => b.type === 'text');
+        if (textBlocks.length > 0) {
+          messageTexts.push(`[Tool Result]: ${textBlocks.map((b: any) => b.text).join(' ').slice(0, 500)}`);
+        }
+      }
+    }
+
+    if (messageTexts.length === 0) return;
+
+    const turnText = messageTexts.join('\n').slice(0, 8000);
+
+    // Debounce writes
+    pendingTurns.push({ session, turn: event.data.turn, messages: turnText });
+
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      flushPendingTurns().catch(() => {});
+    }, cfg.debounceMs);
+  });
+
+  // --- Hook 2: agent/pre-step → inject INDEX.md (memory-entry context) ---
+  // agent/pre-step signature: (this: Scoped<Agent>, payload, next) => Promise<PreStepDecision>
+  // The payload does NOT contain `agent` — it's injected by the dispatcher.
+  // `this` carries the scope — we extract agent from it. MUST use regular function (not arrow)
+  // so `this` binding is preserved by the dispatch system.
+  ctx.on(
+    'agent/pre-step',
+    async function (
+      this: any,
+      payload: {
+        messages: UserMessage[];
+        turn: number;
+        step: number;
+        signal: AbortSignal;
+      },
+      next: () => Promise<
+        { kind: 'enter'; messages: UserMessage[] } | { kind: 'reject' }
+      >,
+    ): Promise<{ kind: 'enter'; messages: UserMessage[] } | { kind: 'reject' }> {
+      const decision = await next();
+      if (decision.kind === 'reject') return decision;
+
+      // Get agent from scope carrier
+      const agent = this?.subject as Agent | undefined;
+      if (!agent) return decision;
+
+      // Resolve session through the store (Agent interface only exposes .id)
+      const session = ctx.sessions.get(agent.id);
+      if (!session) return decision;
+
+      const sessionId = agent.id as string;
+      let augmentedMessages = [...decision.messages];
+
+      // --- Index injection ---
+      if (cfg.progressEnabled) {
+        const idxId = memoryId('index', sessionId);
+        if (!injectedMemories.has(idxId)) {
+          const cwd = session.header?.cwd ?? process.cwd();
+          const progressDir = join(cwd, cfg.progressDir);
+          const indexPath = join(progressDir, 'INDEX.md');
+
+          if (existsSync(indexPath)) {
+            let indexContent = readFileSync(indexPath, 'utf-8');
+            if (Buffer.byteLength(indexContent, 'utf-8') > cfg.indexMaxBytes) {
+              indexContent = indexContent.slice(0, cfg.indexMaxBytes);
+            }
+            const lines = indexContent.split('\n');
+            if (lines.length > cfg.indexMaxLines) {
+              indexContent = lines.slice(0, cfg.indexMaxLines).join('\n') + '\n(index truncated)';
+            }
+
+            const indexMessage = createUserMessage({
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `<system-reminder data-role="progress-index">\n## Project Progress Index\n\n${indexContent}\n\nUse the \`progress_read\` tool to load full entry details as needed.\n</system-reminder>`,
+                },
+              ],
+              source: { kind: 'plugin' as const, plugin: 'dsh-dev-progress-memory' },
+            });
+
+            augmentedMessages = [indexMessage, ...augmentedMessages];
+            injectedMemories.add(idxId);
+          }
+        }
+      }
+
+      // --- System memory retrieval ---
+      if (cfg.systemMemoryEnabled) {
+        const userText = payload.messages
+          .flatMap((m) => m.content)
+          .filter((b) => b.type === 'text')
+          .map((b) => b.text)
+          .join(' ');
+
+        const hasErrorTrigger = ERROR_TRIGGER_KEYWORDS.some((kw) =>
+          userText.includes(kw),
+        );
+
+        if (hasErrorTrigger) {
+          const matched = searchSystemMemory(ERROR_TRIGGER_KEYWORDS);
+          if (matched) {
+            const sysMemId = memoryId('sysmem', `${sessionId}:${payload.turn}`);
+            if (!injectedMemories.has(sysMemId)) {
+              const sysMemMessage = createUserMessage({
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `<system-reminder data-role="system-memory">\n## Known Issues → Existing Solutions\n\n${matched}\n\n(Retrieved from cross-project bug memory. Use these known solutions as a starting point.)\n</system-reminder>`,
+                  },
+                ],
+                source: { kind: 'plugin' as const, plugin: 'dsh-dev-progress-memory' },
+              });
+
+              augmentedMessages.push(sysMemMessage);
+              injectedMemories.add(sysMemId);
+            }
+          }
+        }
+      }
+
+      // --- Proactive compact pressure detection ---
+      if (cfg.compactEnabled) {
+        try {
+          const measurement = ctx.tokenMeter.measure(session);
+          const contextWindow = session.requestContext()?.contextWindow;
+
+          if (contextWindow && contextWindow > 0) {
+            const pressure = measurement.totalTokens / contextWindow;
+
+            if (pressure >= cfg.compactPressureRatio) {
+              const compactState = compactStates.get(sessionId);
+              const currentGen = session.surface.replaceGeneration;
+
+              if (!compactState || compactState.lastCompactGeneration !== currentGen) {
+                ctx.logger?.info?.(
+                  `[dev-progress-memory] Token pressure ${(pressure * 100).toFixed(1)}% >= threshold ${(cfg.compactPressureRatio * 100).toFixed(0)}%, triggering compact`,
+                );
+
+                try {
+                  const result = await ctx.compaction.compactIfNeeded(
+                    {
+                      session,
+                      options: (agent as any).options ?? {},
+                    },
+                    'pressure',
+                    payload.signal,
+                  );
+
+                  if (result) {
+                    compactStates.set(sessionId, {
+                      lastCompactGeneration: session.surface.replaceGeneration,
+                      turnTokenBaseline: ctx.tokenMeter.measure(session).totalTokens,
+                    });
+                  }
+                } catch (err) {
+                  ctx.logger?.warn?.(
+                    `[dev-progress-memory] Compact failed (non-blocking): ${errorChain(err)}`,
+                  );
+                }
+              }
+            }
+          }
+        } catch {
+          // Silent degrade: token meter or compaction might be unavailable
+        }
+      }
+
+      return { kind: 'enter', messages: augmentedMessages };
+    },
+  );
+
+  // --- Hook 3: agent/request-error → overflow fallback ---
+  // agent/request-error signature: (this: Scoped<Agent>, payload, next) => Promise<RequestErrorAction>
+  // MUST use regular function (not arrow) for correct `this` binding.
+  ctx.on(
+    'agent/request-error',
+    async function (
+      this: any,
+      payload: {
+        turn: number;
+        step: number;
+        provider: string;
+        failure: { message: string; code: string };
+        retryPolicy: any;
+        signal: AbortSignal;
+      },
+      next: () => Promise<{ kind: 'retry' } | undefined>,
+    ): Promise<{ kind: 'retry' } | undefined> {
+      // Only intercept context-window exceeded
+      const CONTEXT_WINDOW_EXCEEDED = 'context_window_exceeded';
+      if (
+        payload.failure.code !== CONTEXT_WINDOW_EXCEEDED &&
+        payload.failure.code !== 'CONTEXT_WINDOW_EXCEEDED'
+      ) {
+        return next();
+      }
+
+      const agent = this?.subject as Agent | undefined;
+      if (!agent) return next();
+
+      const session = ctx.sessions.get(agent.id);
+      if (!session) return next();
+
+      ctx.logger?.info?.('[dev-progress-memory] Context window exceeded; attempting recovery');
+
+      try {
+        // Attempt one compaction with context-overflow trigger
+        await ctx.compaction.compactIfNeeded(
+          {
+            session,
+            options: (agent as any).options ?? {},
+          },
+          'context-overflow',
+          payload.signal,
+        );
+
+        // After compact, signal retry (exactly once)
+        return { kind: 'retry' as const };
+      } catch (err) {
+        // Compact + retry failed — generate handoff
+        ctx.logger?.warn?.(
+          '[dev-progress-memory] Overflow recovery failed; generating handoff document',
+        );
+
+        try {
+          const cwd = session.header?.cwd ?? process.cwd();
+          const progressDir = join(cwd, cfg.progressDir);
+          ensureDir(progressDir);
+
+          const handoffContent = [
+            '# Session Handoff',
+            '',
+            `**Date**: ${new Date().toISOString()}`,
+            `**Session**: ${session.id}`,
+            `**Last Turn**: ${payload.turn}`,
+            '',
+            '## Context Overflow',
+            '',
+            'This session exceeded the model context window. A new session is recommended.',
+            'Current project progress has been saved to `doc/progress/`.',
+            '',
+            'To continue, start a new session. The progress index will be injected automatically.',
+          ].join('\n');
+
+          const handoffPath = join(
+            progressDir,
+            `HANDOFF-${new Date().toISOString().slice(0, 10)}.md`,
+          );
+          writeFileSync(handoffPath, handoffContent);
+          updateIndex(
+            'handoff',
+            `HANDOFF-${new Date().toISOString().slice(0, 10)}.md`,
+            'Session context overflow handoff',
+          );
+
+          // Inject visible handoff message
+          const handoffMessage = createUserMessage({
+            content: [
+              {
+                type: 'text' as const,
+                text: `<system-reminder data-role="handoff">\n⚠️ 会话上下文已接近硬限制。建议开启新会话继续工作。\n\n当前项目进度已保存至 \`doc/progress/INDEX.md\`。新会话将自动加载进度索引。\n</system-reminder>`,
+              },
+            ],
+            source: { kind: 'plugin' as const, plugin: 'dsh-dev-progress-memory' },
+          });
+
+          (agent as any).inject?.(handoffMessage);
+        } catch {
+          // fully silent
+        }
+
+        return undefined; // Don't retry — avoid burning tokens
+      }
+    },
+  );
+
+  // --- Cleanup on session disposal ---
+  ctx.on('session/disposed', (_session: Session) => {
+    const sessionId = _session.id as string;
+    compactStates.delete(sessionId);
+    for (const id of [...injectedMemories]) {
+      if (id.includes(sessionId)) injectedMemories.delete(id);
+    }
+  });
+
+  // --- Flush pending writes on shutdown ---
+  ctx.on('dispose', () => {
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+    if (pendingTurns.length > 0) {
+      try {
+        const allText = pendingTurns
+          .map((t) => `[Turn ${t.turn}]\n${t.messages}`)
+          .join('\n\n---\n\n');
+        pendingTurns = [];
+
+        const sessions = ctx.sessions?.list() ?? [];
+        const cwd = sessions[0]?.header?.cwd ?? process.cwd();
+        const progressDir = join(cwd, cfg.progressDir);
+        ensureDir(progressDir);
+
+        const today = new Date().toISOString().slice(0, 10);
+        writeFileSync(
+          join(progressDir, `shutdown-${today}.md`),
+          `# Shutdown Flush\n\n${allText.slice(0, 4000)}`,
+        );
+      } catch {
+        // best effort
+      }
+    }
+  });
+
+  ctx.logger?.info?.('[dev-progress-memory] Plugin initialized');
+}
