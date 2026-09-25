@@ -7,14 +7,27 @@
   },
   "type": "module",
   "main": "lib/index.js",
-  "types": "lib/types/index.d.ts",
   "exports": {
     ".": {
-      "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
     "./package.json": "./package.json"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whding110/dsh-dev-progress-memory.git"
+  },
+  "homepage": "https://github.com/whding110/dsh-dev-progress-memory#readme",
+  "bugs": {
+    "url": "https://github.com/whding110/dsh-dev-progress-memory/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "progress"
+  ],
   "files": [
     "lib/index.js",
     "cordis.patch.yml"
