@@ -1,7 +1,7 @@
 {
   "name": "dsh-dev-progress-memory",
   "description": "DSH plugin: dev progress tracking, system bug memory, token optimization, and context compact continuation",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publishConfig": {
     "access": "public"
   },
